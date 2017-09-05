@@ -166,6 +166,8 @@ int open_output_file(const char *filename, const AVFormatContext *ifmt_ctx, AVFo
                     enc_ctx->sample_fmt = encoder->sample_fmts[0];
                 }
                 enc_ctx->time_base = (AVRational) { 1, enc_ctx->sample_rate };
+                enc_ctx->bit_rate = 64000;
+                enc_ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
                 
             }
             
@@ -419,45 +421,6 @@ int init_filters(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ct
     return 0;
 }
 
-int encode_video(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
-    AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
-    int ret;
-    int got_frame_local;
-    AVPacket enc_pkt;
-
-    int(*enc_func)(AVCodecContext *, AVPacket *, const AVFrame *, int *) =
-        (ifmt_ctx->streams[stream_index]->codecpar->codec_type ==
-            AVMEDIA_TYPE_VIDEO) ? avcodec_encode_video2 : avcodec_encode_audio2;
-
-    if (!got_frame)
-        got_frame = &got_frame_local;
-
-    DEBUG_LOG("Encoding frame\n");
-    /* encode filtered frame */
-    enc_pkt.data = NULL;
-    enc_pkt.size = 0;
-    av_init_packet(&enc_pkt);
-    ret = enc_func(stream_ctx[stream_index].enc_ctx, &enc_pkt,
-        filt_frame, got_frame);
-    av_frame_free(&filt_frame);
-    if (ret < 0)
-        return ret;
-    if (!(*got_frame))
-        return 0;
-
-    /* prepare packet for muxing */
-    enc_pkt.stream_index = stream_index;
-    av_packet_rescale_ts(&enc_pkt,
-        stream_ctx[stream_index].enc_ctx->time_base,
-        ofmt_ctx->streams[stream_index]->time_base);
-
-    DEBUG_LOG("Muxing frame\n");
-    /* mux encoded frame */
-    ret = av_write_frame(ofmt_ctx, &enc_pkt);
-    //fwrite(enc_pkt.data, 1, enc_pkt.size, fp);
-    return ret;
-}
-
 int encode_video2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
     AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
     int ret;
@@ -504,46 +467,9 @@ int encode_video2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_c
         av_packet_unref(&enc_pkt);
     }
 
-    av_frame_free(&filt_frame);
-
     return 0;
 }
 
-int encode_audio(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
-    AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
-    int ret;
-    int got_frame_local;
-    AVPacket enc_pkt;
-
-    int(*enc_func)(AVCodecContext *, AVPacket *, const AVFrame *, int *) =
-        (ifmt_ctx->streams[stream_index]->codecpar->codec_type ==
-            AVMEDIA_TYPE_VIDEO) ? avcodec_encode_video2 : avcodec_encode_audio2;
-
-    if (!got_frame)
-        got_frame = &got_frame_local;
-
-    DEBUG_LOG("Encoding frame\n");
-    /* encode filtered frame */
-    enc_pkt.data = NULL;
-    enc_pkt.size = 0;
-    av_init_packet(&enc_pkt);
-    ret = enc_func(stream_ctx[stream_index].enc_ctx, &enc_pkt,
-        filt_frame, got_frame);
-    
-    av_frame_free(&filt_frame);
-    if (ret < 0)
-        return ret;
-    if (!(*got_frame))
-        return 0;
-
-    /* prepare packet for muxing */
-    enc_pkt.stream_index = stream_index;
-
-    DEBUG_LOG("Muxing frame\n");
-    /* mux encoded frame */
-    ret = av_write_frame(ofmt_ctx, &enc_pkt);
-    return ret;
-}
 
 int encode_audio2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
     AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
@@ -596,8 +522,6 @@ int encode_audio2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_c
         av_packet_unref(&enc_pkt);
     }
 
-    av_frame_free(&filt_frame);
-
     return 0;
 }
 
@@ -608,6 +532,19 @@ int encode_write_frame(const AVFormatContext *ifmt_ctx, const AVFormatContext *o
     }else {
         return encode_video2(ifmt_ctx, ofmt_ctx, stream_ctx, filt_frame, stream_index, got_frame);
     }
+}
+
+
+/** Initialize a FIFO buffer for the audio samples to be encoded. */
+static int init_fifo(AVAudioFifo **fifo, AVCodecContext *output_codec_context)
+{
+    /** Create the FIFO buffer based on the specified output sample format. */
+    if (!(*fifo = av_audio_fifo_alloc(output_codec_context->sample_fmt,
+                                      output_codec_context->channels, 1))) {
+        fprintf(stderr, "Could not allocate FIFO\n");
+        return AVERROR(ENOMEM);
+    }
+    return 0;
 }
 
 int filter_encode_write_frame(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx, 
@@ -644,6 +581,7 @@ int filter_encode_write_frame(const AVFormatContext *ifmt_ctx, const AVFormatCon
         }
         filt_frame->pict_type = AV_PICTURE_TYPE_NONE;
         ret = encode_write_frame(ifmt_ctx, ofmt_ctx, stream_ctx, filt_frame, stream_index, NULL);
+        av_frame_free(&filt_frame);
         if (ret < 0)
             break;
     }
@@ -669,78 +607,6 @@ static int flush_encoder(const AVFormatContext *ifmt_ctx, const AVFormatContext 
             return 0;
     }
     return ret;
-}
-
-void print_info(const AVFormatContext *ifmt_ctx) {
-    printf("filename: %s\n", ifmt_ctx->filename);
-    int iTotalSeconds = (int)ifmt_ctx->duration/*微秒*/ / 1000000;
-    int iHour = iTotalSeconds / 3600;//小时  
-    int iMinute = iTotalSeconds % 3600 / 60;//分钟  
-    int iSecond = iTotalSeconds % 60;//秒  
-    AVDictionaryEntry *dict = NULL;
-    AVCodecContext *pCodecCtx = NULL;
-    AVCodec *pCodec;
-
-    pCodecCtx = ifmt_ctx->streams[0]->codec;   //指向AVCodecContext的指针  
-    pCodec = avcodec_find_decoder(pCodecCtx->codec_id);  //指向AVCodec的指针.查找解码器  
-
-    printf("持续时间：%02d:%02d:%02d\n", iHour, iMinute, iSecond);
-
-    puts("---------------------------------------------");
-
-    puts("AVInputFormat信息:");
-    puts("---------------------------------------------");
-    printf("封装格式名称：%s\n", ifmt_ctx->iformat->name);
-    printf("封装格式长名称：%s\n", ifmt_ctx->iformat->long_name);
-    printf("封装格式扩展名：%s\n", ifmt_ctx->iformat->extensions);
-    printf("封装格式ID：%d\n", ifmt_ctx->iformat->raw_codec_id);
-    puts("---------------------------------------------");
-
-    puts("AVStream信息:");
-    puts("---------------------------------------------");
-    printf("视频流标识符：%d\n", ifmt_ctx->streams[0]->index);
-    printf("音频流标识符：%d\n", ifmt_ctx->streams[1]->index);
-    printf("视频流长度：%d微秒\n", ifmt_ctx->streams[0]->duration);
-    printf("音频流长度：%d微秒\n", ifmt_ctx->streams[1]->duration);
-    puts("---------------------------------------------");
-
-    puts("AVCodecContext信息:");
-    puts("---------------------------------------------");
-    printf("视频码率：%d kb/s\n", pCodecCtx->bit_rate / 1000);
-    printf("视频大小：%d * %d\n", pCodecCtx->width, pCodecCtx->height);
-    puts("---------------------------------------------");
-
-    puts("AVCodec信息:");
-    puts("---------------------------------------------");
-    printf("视频编码格式：%s\n", pCodec->name);
-    printf("视频编码详细格式：%s\n", pCodec->long_name);
-    puts("---------------------------------------------");
-
-    printf("视频时长：%d微秒\n", ifmt_ctx->streams[0]->duration);
-    printf("音频时长：%d微秒\n", ifmt_ctx->streams[1]->duration);
-    printf("音频采样率：%d\n", ifmt_ctx->streams[1]->codec->sample_rate);
-    printf("音频信道数目：%d\n", ifmt_ctx->streams[1]->codec->channels);
-
-    puts("AVFormatContext元数据：");
-    puts("---------------------------------------------");
-    dict = NULL;
-    while (dict = av_dict_get(ifmt_ctx->streams[0]->metadata, "", dict, AV_DICT_IGNORE_SUFFIX))
-    {
-        printf("[%s] = %s\n", dict->key, dict->value);
-    }
-    puts("---------------------------------------------");
-
-    puts("AVStream音频元数据：");
-    puts("---------------------------------------------");
-    dict = NULL;
-    while (dict = av_dict_get(ifmt_ctx->streams[1]->metadata, "", dict, AV_DICT_IGNORE_SUFFIX))
-    {
-        printf("[%s] = %s\n", dict->key, dict->value);
-    }
-    puts("---------------------------------------------");
-
-    printf("\n\n编译信息：\n%s\n\n", avcodec_configuration());
-    return 0;
 }
 
 static void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt, const char *tag)
@@ -773,11 +639,6 @@ int create_trans_task(char *input_filename, char *output_filename) {
     AVFrame *frame = NULL;
     int(*dec_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
 
-    fp = fopen("./output-pipe.ts", "wb");
-
-    //freopen("output.ts", "w", stdout); //输出重定向，输出数据将保存在out.txt文件中 
-    //freopen("output.txt", "w", stderr); //输出重定向，输出数据将保存在out.txt文件中 
-
 
     if(input_filename == NULL || output_filename == NULL){
         return -1;
@@ -789,8 +650,6 @@ int create_trans_task(char *input_filename, char *output_filename) {
     if((ret = open_input_file(input_filename, &ifmt_ctx, &stream_ctx)) < 0){
         goto end;
     }
-
-    print_info(ifmt_ctx);
 
     if((ret = open_output_file(output_filename, ifmt_ctx, &ofmt_ctx, &stream_ctx)) < 0){
         goto end;

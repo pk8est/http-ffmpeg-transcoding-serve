@@ -9,7 +9,7 @@
 #define STDERR  2
 #define BLOCK_SIZE 4096
 
-char *file_path = "/mnt/hgfs/web/c++/ffmpeg-transocding/build%s";
+char *file_path = "/mnt/hgfs/web/c++/http-ffmpeg-transocding/build%s";
 
 void http_transcoding_handler(int client, const char *path, const char *method, const char *query_string)
 {
