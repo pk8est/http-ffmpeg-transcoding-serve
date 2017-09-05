@@ -8,7 +8,8 @@
 #define WARNING_LOG(fmt, ...) av_log(NULL, AV_LOG_WARNING, "[%s:%d] WARNING: " fmt, __FILE__, __LINE__, ##__VA_ARGS__);
 #define FATAL_LOG(fmt, ...) av_log(NULL, AV_LOG_FATAL, "[%s:%d] FATAL: " fmt, __FILE__, __LINE__, ##__VA_ARGS__);
 
-FILE *fp;
+static stream_video_index;
+static stream_audio_index;
 static enum log_level_enum log_level = INFO;
 static EncodeParam default_encode_param = {
     "libx264", "aac", 900000,
@@ -41,7 +42,6 @@ int open_input_file(const char *filename, AVFormatContext **ifmt_ctx, StreamCont
     }
 
     *stream_ctx = av_mallocz_array((*ifmt_ctx)->nb_streams, sizeof(**stream_ctx));
-    printf("stream_ctx=%s", *stream_ctx);
     if (!*stream_ctx)
         return AVERROR(ENOMEM);
 
@@ -157,6 +157,7 @@ int open_output_file(const char *filename, const AVFormatContext *ifmt_ctx, AVFo
                 enc_ctx->me_subpel_quality = 1;//决定编码速度，越小，编码速度越快
                 enc_ctx->has_b_frames = 0;
                 enc_ctx->max_b_frames = 0;
+                stream_video_index = i;
             }else {
                 
                 enc_ctx->sample_rate = dec_ctx->sample_rate;
@@ -168,7 +169,7 @@ int open_output_file(const char *filename, const AVFormatContext *ifmt_ctx, AVFo
                 enc_ctx->time_base = (AVRational) { 1, enc_ctx->sample_rate };
                 enc_ctx->bit_rate = 64000;
                 enc_ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
-                
+                stream_audio_index = i;
             }
             
             //H.264
@@ -229,13 +230,18 @@ int open_output_file(const char *filename, const AVFormatContext *ifmt_ctx, AVFo
         }
     }
 
-    /* init muxer, write output file header */
-    ret = avformat_write_header(*ofmt_ctx, NULL);
-    if (ret < 0) {
-        ERROR_LOG("Error occurred when opening output file: %s!\n", av_err2str(ret));
-        return ret;
-    }
+    return 0;
+}
 
+/** Write the header of the output file container. */
+static int write_output_file_header(AVFormatContext *output_format_context)
+{
+    int error;
+    if ((error = avformat_write_header(output_format_context, NULL)) < 0) {
+        fprintf(stderr, "Could not write output file header (error '%s')\n",
+                av_err2str(error));
+        return error;
+    }
     return 0;
 }
 
@@ -421,7 +427,7 @@ int init_filters(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ct
     return 0;
 }
 
-int encode_video2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
+int encode_video(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
     AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
     int ret;
     int got_frame_local;
@@ -471,7 +477,7 @@ int encode_video2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_c
 }
 
 
-int encode_audio2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
+int encode_audio(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
     AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
     int ret;
     int got_frame_local;
@@ -528,23 +534,10 @@ int encode_audio2(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_c
 int encode_write_frame(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx,
     AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
     if (ifmt_ctx->streams[stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        return encode_audio2(ifmt_ctx, ofmt_ctx, stream_ctx, filt_frame, stream_index, got_frame);
+        return encode_audio(ifmt_ctx, ofmt_ctx, stream_ctx, filt_frame, stream_index, got_frame);
     }else {
-        return encode_video2(ifmt_ctx, ofmt_ctx, stream_ctx, filt_frame, stream_index, got_frame);
+        return encode_video(ifmt_ctx, ofmt_ctx, stream_ctx, filt_frame, stream_index, got_frame);
     }
-}
-
-
-/** Initialize a FIFO buffer for the audio samples to be encoded. */
-static int init_fifo(AVAudioFifo **fifo, AVCodecContext *output_codec_context)
-{
-    /** Create the FIFO buffer based on the specified output sample format. */
-    if (!(*fifo = av_audio_fifo_alloc(output_codec_context->sample_fmt,
-                                      output_codec_context->channels, 1))) {
-        fprintf(stderr, "Could not allocate FIFO\n");
-        return AVERROR(ENOMEM);
-    }
-    return 0;
 }
 
 int filter_encode_write_frame(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ctx, const StreamContext *stream_ctx, 
@@ -609,16 +602,109 @@ static int flush_encoder(const AVFormatContext *ifmt_ctx, const AVFormatContext 
     return ret;
 }
 
-static void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt, const char *tag)
+static int decode_video(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, StreamContext *stream_ctx, FilteringContext *filter_ctx, AVFrame *frame, AVPacket *packet)
 {
-    AVRational *time_base = &fmt_ctx->streams[pkt->stream_index]->time_base;
+    int ret, stream_index;
+    AVCodecContext *dec_ctx, *enc_ctx;
+    stream_index = packet->stream_index;
+    dec_ctx = stream_ctx[stream_index].dec_ctx;
+    enc_ctx = stream_ctx[stream_index].enc_ctx;
 
-    printf("%s: pts:%s pts_time:%s dts:%s dts_time:%s duration:%s duration_time:%s stream_index:%d\n",
-        tag,
-        av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, time_base),
-        av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, time_base),
-        av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, time_base),
-        pkt->stream_index);
+    ret = avcodec_send_packet(dec_ctx, packet);
+    if (ret < 0 && ret != AVERROR_EOF) {
+        ERROR_LOG("avcodec_send_packet fail %d\n", ret);
+        return ret;
+    }
+
+    while (ret >= 0) {
+        
+        ret = avcodec_receive_frame(dec_ctx, frame);
+
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        }
+        else if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder\n");
+            goto end;
+        }
+
+        if (ret >= 0) {
+            
+            //frame->pts = frame->best_effort_timestamp;  
+            frame->pts = av_frame_get_best_effort_timestamp(frame);
+            ret = filter_encode_write_frame(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, stream_index);
+            av_frame_free(&frame);
+            if (ret < 0) {
+                goto end;
+            }
+        }
+        else {
+            av_frame_free(&frame);
+        }
+
+    }
+
+end: 
+    //TODO
+
+    return 0;
+}
+
+static int decode_audio(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, StreamContext *stream_ctx, FilteringContext *filter_ctx, AVFrame *frame, AVPacket *packet)
+{
+    int ret, stream_index;
+    AVCodecContext *dec_ctx, *enc_ctx;
+    stream_index = packet->stream_index;
+    dec_ctx = stream_ctx[stream_index].dec_ctx;
+    enc_ctx = stream_ctx[stream_index].enc_ctx;
+
+    ret = avcodec_send_packet(dec_ctx, packet);
+    if (ret < 0 && ret != AVERROR_EOF) {
+        ERROR_LOG("avcodec_send_packet fail %d\n", ret);
+        return ret;
+    }
+
+    while (ret >= 0) {
+        
+        ret = avcodec_receive_frame(dec_ctx, frame);
+
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        }
+        else if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder\n");
+            goto end;
+        }
+
+        if (ret >= 0) {
+            
+            //frame->pts = frame->best_effort_timestamp;  
+            frame->pts = av_frame_get_best_effort_timestamp(frame);
+            ret = filter_encode_write_frame(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, stream_index);
+            av_frame_free(&frame);
+            if (ret < 0) {
+                goto end;
+            }
+        }
+        else {
+            av_frame_free(&frame);
+        }
+
+    }
+
+end: 
+    //TODO
+
+    return 0;
+}
+
+static int decode(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, StreamContext *stream_ctx, FilteringContext *filter_ctx, AVFrame *frame, AVPacket *packet)
+{
+    if (ifmt_ctx->streams[packet->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        return decode_audio(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, packet);
+    }else {
+        return decode_video(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, packet);
+    }
 }
 
 int create_trans_task(char *input_filename, char *output_filename) {
@@ -634,6 +720,8 @@ int create_trans_task(char *input_filename, char *output_filename) {
     AVFormatContext *ofmt_ctx = NULL;
     StreamContext *stream_ctx = NULL;
     FilteringContext *filter_ctx = NULL;
+    SwrContext *resample_context = NULL;
+    AVAudioFifo *fifo = NULL;
     enum AVMediaType type;
     AVPacket packet = { .data = NULL,.size = 0 };
     AVFrame *frame = NULL;
@@ -656,6 +744,11 @@ int create_trans_task(char *input_filename, char *output_filename) {
     }
 
     if ((ret = init_filters(ifmt_ctx, ofmt_ctx, stream_ctx, &filter_ctx)) < 0) {
+        goto end;
+    }
+
+    /** Write the header of the output file container. */
+    if ((ret = write_output_file_header(ofmt_ctx)) < 0){
         goto end;
     }
 
@@ -686,8 +779,13 @@ int create_trans_task(char *input_filename, char *output_filename) {
             ifmt_ctx->streams[stream_index]->time_base,
             stream_ctx[stream_index].dec_ctx->time_base);
 
-        /*************************/
+        ret = decode(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, &packet);
+        if(ret < 0){
+            continue;
+        }
 
+        /*************************/
+        /*
         AVCodecContext *dec_ctx, *enc_ctx;
         stream_index = packet.stream_index;
         dec_ctx = stream_ctx[stream_index].dec_ctx;
@@ -726,6 +824,8 @@ int create_trans_task(char *input_filename, char *output_filename) {
             }
 
         }
+        */
+        /******************************/
         
     }
 
