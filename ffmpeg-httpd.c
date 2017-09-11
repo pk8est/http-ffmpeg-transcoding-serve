@@ -60,8 +60,9 @@ int run_transcoding() {
     int ret;
     int64_t ti; 
     char *inputFile = "./build/input.mp4";
+    //char *inputFile = "./build/input01.ts";
     char *outputFile = "./build/output.ts";
-    set_log_level(VERBOSE);
+    av_log_set_level(AV_LOG_VERBOSE);
     ti = av_gettime_relative();
     //ret = create_trans_task(inputFile, "pipe:");
     ret = create_trans_task(inputFile, outputFile);

@@ -19,6 +19,10 @@
 #include <libavutil/timestamp.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/avassert.h>
+#include <libavformat/avio.h>
+#include <libswresample/swresample.h>
+
 
 
 

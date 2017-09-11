@@ -456,10 +456,10 @@ int encode_video(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ct
     while (ret >= 0) {
         ret = avcodec_receive_packet(enc_ctx, &enc_pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            return ret;
+            goto end;
         else if (ret < 0) {
             fprintf(stderr, "Error during encoding\n");
-            return ret;
+            goto end;
         }
         enc_pkt.stream_index = stream_index;
         av_packet_rescale_ts(&enc_pkt, enc_ctx->time_base, ofmt_ctx->streams[stream_index]->time_base);
@@ -470,10 +470,12 @@ int encode_video(const AVFormatContext *ifmt_ctx, const AVFormatContext *ofmt_ct
             fprintf(stderr, "Error av_write_frame\n");
         }
         //fwrite(enc_pkt->data, 1, enc_pkt->size, outfile);
-        av_packet_unref(&enc_pkt);
     }
 
-    return 0;
+end:
+
+    av_packet_unref(&enc_pkt);
+    return ret;
 }
 
 
@@ -621,12 +623,16 @@ static int decode_video(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, St
         ret = avcodec_receive_frame(dec_ctx, frame);
 
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_frame_free(&frame);
             break;
         }
         else if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder\n");
+            av_frame_free(&frame);
             goto end;
         }
+
+        //printf("video_frame n:%d nb_samples:%d, pts:%s\n", 0, frame->nb_samples, av_ts2timestr(frame->pts, &dec_ctx->time_base));
 
         if (ret >= 0) {
             
@@ -676,6 +682,8 @@ static int decode_audio(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, St
             goto end;
         }
 
+        //printf("audio_frame n:%d nb_samples:%d, pts:%s\n", 0, frame->nb_samples, av_ts2timestr(frame->pts, &dec_ctx->time_base));
+
         if (ret >= 0) {
             
             //frame->pts = frame->best_effort_timestamp;  
@@ -701,7 +709,7 @@ end:
 static int decode(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, StreamContext *stream_ctx, FilteringContext *filter_ctx, AVFrame *frame, AVPacket *packet)
 {
     if (ifmt_ctx->streams[packet->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        return decode_audio(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, packet);
+        //return decode_audio(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, packet);
     }else {
         return decode_video(ifmt_ctx, ofmt_ctx, stream_ctx, filter_ctx, frame, packet);
     }
